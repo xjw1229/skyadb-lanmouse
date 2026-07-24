@@ -1,0 +1,162 @@
+package com.sky22333.skyadb.ui.mirror
+
+import android.view.MotionEvent
+import android.view.Surface
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.sky22333.skyadb.AppServices
+import com.sky22333.skyadb.data.AppSettingsStore
+import com.sky22333.skyadb.model.AdbOperationResult
+import com.sky22333.skyadb.model.OperationStatus
+import com.sky22333.skyadb.scrcpy.MirrorQualityPreset
+import com.sky22333.skyadb.scrcpy.MirrorTouchEvent
+import com.sky22333.skyadb.scrcpy.ScrcpyRepository
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+
+data class MirrorUiState(
+    val status: OperationStatus = OperationStatus.Idle,
+    val deviceName: String = "屏幕镜像",
+    val videoWidth: Int = 0,
+    val videoHeight: Int = 0,
+    val qualityPreset: MirrorQualityPreset = MirrorQualityPreset.Balanced,
+)
+
+class MirrorViewModel(
+    private val repository: ScrcpyRepository = AppServices.scrcpyRepository,
+    private val settingsStore: AppSettingsStore = AppServices.settingsStore,
+) : ViewModel() {
+    private val state = MutableStateFlow(MirrorUiState())
+    val uiState: StateFlow<MirrorUiState> = state.asStateFlow()
+
+    /** 控制指令串行发送；与 stop 解耦，避免 onCleared 取消正在释放的会话。 */
+    private val controlScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val controlCommands = Channel<ControlCommand>(Channel.UNLIMITED)
+    private var started = false
+
+    init {
+        controlScope.launch { processControlCommands() }
+        viewModelScope.launch {
+            settingsStore.settings.collect { settings ->
+                state.value = state.value.copy(qualityPreset = settings.mirrorQualityPreset)
+            }
+        }
+    }
+
+    fun start(surface: Surface) {
+        if (started) return
+        started = true
+        state.value = state.value.copy(status = OperationStatus.Running("正在启动屏幕镜像"))
+        viewModelScope.launch {
+            val qualityPreset = settingsStore.settings.first().mirrorQualityPreset
+            if (!started || !surface.isValid) return@launch
+            state.value = state.value.copy(qualityPreset = qualityPreset)
+            when (
+                val result = repository.start(
+                    surface = surface,
+                    qualityPreset = qualityPreset,
+                    onVideoSize = { width, height ->
+                        state.value = state.value.copy(videoWidth = width, videoHeight = height)
+                    },
+                    onStreamError = { error ->
+                        started = false
+                        state.value = state.value.copy(
+                            status = OperationStatus.Failed(
+                                text = "屏幕镜像已断开",
+                                suggestion = error.message ?: "请重新进入屏幕镜像。",
+                            ),
+                        )
+                    },
+                )
+            ) {
+                is AdbOperationResult.Success -> {
+                    state.value = state.value.copy(
+                        status = OperationStatus.Success("正在镜像"),
+                        deviceName = result.data.name,
+                    )
+                }
+                is AdbOperationResult.Failure -> {
+                    started = false
+                    state.value = state.value.copy(
+                        status = OperationStatus.Failed(result.message, result.suggestion),
+                    )
+                }
+            }
+        }
+    }
+
+    fun sendTouch(event: MotionEvent, width: Int, height: Int) {
+        val touch = MirrorTouchEvent.from(event, width, height) ?: return
+        controlCommands.trySend(ControlCommand.Touch(touch))
+    }
+
+    fun sendKey(keyCode: Int) {
+        controlCommands.trySend(ControlCommand.Key(keyCode))
+    }
+
+    fun sendText(text: String) {
+        if (text.isEmpty()) return
+        controlCommands.trySend(ControlCommand.Text(text))
+    }
+
+    fun detachSurface() {
+        stop()
+    }
+
+    fun stop() {
+        started = false
+        state.value = MirrorUiState()
+        repository.requestStop()
+    }
+
+    override fun onCleared() {
+        started = false
+        controlCommands.close()
+        controlScope.cancel()
+        repository.requestStop()
+        super.onCleared()
+    }
+
+    private suspend fun processControlCommands() {
+        for (command in controlCommands) {
+            dispatchControl(command)
+        }
+    }
+
+    private suspend fun dispatchControl(command: ControlCommand) {
+        when (command) {
+            is ControlCommand.Touch -> {
+                var touch = command.event
+                if (touch.isMove) {
+                    while (true) {
+                        val next = controlCommands.tryReceive().getOrNull() ?: break
+                        if (next is ControlCommand.Touch && next.event.isMove) {
+                            touch = next.event
+                        } else {
+                            repository.sendTouch(touch)
+                            dispatchControl(next)
+                            return
+                        }
+                    }
+                }
+                repository.sendTouch(touch)
+            }
+            is ControlCommand.Key -> repository.sendKey(command.keyCode)
+            is ControlCommand.Text -> repository.sendText(command.text)
+        }
+    }
+
+    private sealed interface ControlCommand {
+        data class Touch(val event: MirrorTouchEvent) : ControlCommand
+        data class Key(val keyCode: Int) : ControlCommand
+        data class Text(val text: String) : ControlCommand
+    }
+}
