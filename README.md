@@ -1,4 +1,4 @@
-# skyadb 飞鼠版 v34
+# skyadb 飞鼠版 v1.0.35
 
 `skyadb 飞鼠版` 是运行在 Android 手机上的 ADB 管理和电视飞鼠控制工具。它可以通过 WiFi ADB、Wireless Debugging 或 USB OTG 连接手机、平板、电视和盒子，并在电视端部署 `skyadb 飞鼠服务端`，实现局域网飞鼠、遥控器、屏幕镜像、应用管理、文件管理和 Shell 等功能。
 
@@ -35,7 +35,7 @@
 
 ## 自启和恢复策略
 
-v34 使用 root 优先、ADB 兜底的双方案。
+v1.0.35 使用 root 优先、ADB 兜底的双方案。
 
 - 有 root 并授权时：电视端 `skyadb 飞鼠服务端` 会通过自身 Provider 请求 root，写入 `/data/adb/service.d/skyadb-lanmouse.sh` 自启脚本。电视重启后，服务端应自动启动并监听 `19870` 端口。
 - 无 root、没有 root 环境或 root 被拒绝时：手机端使用已有 ADB 连接进行恢复。进入飞鼠连接时，如果发现电视端 `19870` 未启动，会优先做轻量恢复；只有服务端文件缺失或版本不匹配时才需要重新一键部署。
@@ -84,9 +84,9 @@ app/build/outputs/apk/debug/app-debug.apk
 
 ## 版本信息
 
-- 当前源码版本：v34
-- 手机端版本：`1.0.34` / `versionCode 1034`
-- 电视端服务端版本：`1.0.34` / `versionCode 1034`
+- 当前源码版本：v1.0.35
+- 手机端版本：`1.0.35` / `versionCode 1035`
+- 电视端服务端版本：`1.0.35` / `versionCode 1035`
 - 飞鼠服务端口：`19870`
 - 核心协议标识：`X-SkyADB-Core: 7`
 
