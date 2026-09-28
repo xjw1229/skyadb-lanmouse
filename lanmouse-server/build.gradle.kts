@@ -1,4 +1,4 @@
-﻿plugins {
+plugins {
     alias(libs.plugins.android.application)
 }
 
@@ -11,8 +11,8 @@ android {
         applicationId = "com.server.skyadb.lanmouse"
         minSdk = 21
         targetSdk = 34
-        versionCode = 1034
-        versionName = "1.0.34"
+        versionCode = 1036
+        versionName = "1.0.36"
     }
 
     buildTypes {

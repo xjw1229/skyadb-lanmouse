@@ -33,6 +33,10 @@ final class InputController implements AutoCloseable {
     private float touchX;
     private float touchY;
 
+    /** Display size is re-read at most this often so rotation cannot freeze the reachable area. */
+    private static final long SCREEN_REFRESH_INTERVAL_MS = 400L;
+    private long lastScreenRefresh;
+
     InputController() throws Exception {
         screen = ScreenInfo.read();
         cursorX = screen.width / 2f;
@@ -41,13 +45,51 @@ final class InputController implements AutoCloseable {
         inputManager = managerMethod.manager;
         injectInputEvent = managerMethod.method;
         setDisplayId = findSetDisplayId();
-        cursorOverlay = new CursorOverlay(screen);
+        cursorOverlay = createCursorOverlay(screen);
         injectHover();
+    }
+
+    /** Cursor drawing is optional: a box without a usable SurfaceControl still gets input injection. */
+    private static CursorOverlay createCursorOverlay(ScreenInfo screen) {
+        try {
+            return new CursorOverlay(screen);
+        } catch (Throwable error) {
+            System.err.println("SkyADB cursor overlay unavailable, continuing without it: " + error);
+            return null;
+        }
     }
 
     synchronized ScreenInfo screenInfo() {
         screen = ScreenInfo.read();
+        applyScreenBounds();
         return screen;
+    }
+
+    /**
+     * Keeps the cursor coordinate space aligned with the live display.
+     *
+     * <p>The display can rotate or resize at any time (phone turned sideways, split screen, an
+     * override applied by {@code wm size}). Caching the size once made every later cursor move and
+     * touch clamp into the old portrait rectangle, which looked like "only a small corner is
+     * controllable" after the target rotated.
+     */
+    private void refreshScreenIfStale() {
+        long now = SystemClock.uptimeMillis();
+        if (now - lastScreenRefresh < SCREEN_REFRESH_INTERVAL_MS) {
+            return;
+        }
+        lastScreenRefresh = now;
+        ScreenInfo latest = ScreenInfo.read();
+        screen = latest;
+        applyScreenBounds();
+    }
+
+    private void applyScreenBounds() {
+        if (cursorOverlay != null) {
+            cursorOverlay.updateBounds(screen.width, screen.height);
+        }
+        cursorX = clamp(cursorX, 0, screen.width);
+        cursorY = clamp(cursorY, 0, screen.height);
     }
 
     synchronized int cursorX() {
@@ -59,11 +101,11 @@ final class InputController implements AutoCloseable {
     }
 
     synchronized boolean cursorVisible() {
-        return cursorOverlay.isVisible();
+        return cursorOverlay != null && cursorOverlay.isVisible();
     }
 
     synchronized String cursorRenderMode() {
-        return cursorOverlay.renderMode();
+        return cursorOverlay == null ? "none" : cursorOverlay.renderMode();
     }
 
     synchronized int cursorDisplayId() {
@@ -75,6 +117,7 @@ final class InputController implements AutoCloseable {
     }
 
     synchronized void moveCursor(float x, float y, boolean absolute) throws Exception {
+        refreshScreenIfStale();
         if (absolute) {
             cursorX = x;
             cursorY = y;
@@ -84,12 +127,16 @@ final class InputController implements AutoCloseable {
         }
         cursorX = clamp(cursorX, 0, screen.width);
         cursorY = clamp(cursorY, 0, screen.height);
-        cursorOverlay.moveCenter(cursorX, cursorY);
+        if (cursorOverlay != null) {
+            cursorOverlay.moveCenter(cursorX, cursorY);
+        }
         injectHover();
     }
 
     synchronized void cursorTouchDown(float x, float y) {
-        cursorOverlay.press();
+        if (cursorOverlay != null) {
+            cursorOverlay.press();
+        }
     }
 
     synchronized void cursorTouchMove(float x, float y) {
@@ -97,12 +144,16 @@ final class InputController implements AutoCloseable {
     }
 
     synchronized void cursorTouchUp() {
-        cursorOverlay.release();
+        if (cursorOverlay != null) {
+            cursorOverlay.release();
+        }
     }
 
     synchronized void cursorTapAnimation() {
-        cursorOverlay.press();
-        cursorOverlay.release();
+        if (cursorOverlay != null) {
+            cursorOverlay.press();
+            cursorOverlay.release();
+        }
     }
 
     synchronized void tap(long durationMs) throws Exception {
@@ -122,6 +173,7 @@ final class InputController implements AutoCloseable {
     }
 
     synchronized void touchDown(float x, float y) throws Exception {
+        refreshScreenIfStale();
         if (touching) {
             injectTouch(MotionEvent.ACTION_CANCEL, touchX, touchY, touchDownTime);
         }
@@ -131,11 +183,22 @@ final class InputController implements AutoCloseable {
         touchY = touchStartY;
         touchDownTime = SystemClock.uptimeMillis();
         touching = true;
-        cursorOverlay.press();
+        if (cursorOverlay != null) {
+            cursorOverlay.press();
+        }
         injectTouch(MotionEvent.ACTION_DOWN, touchX, touchY, touchDownTime);
     }
 
+    /** Presses at a position expressed as a fraction of the current display. */
+    synchronized void touchDownAtRatio(double ratioX, double ratioY) throws Exception {
+        refreshScreenIfStale();
+        float x = (float) (clamp01(ratioX) * (screen.width - 1));
+        float y = (float) (clamp01(ratioY) * (screen.height - 1));
+        touchDown(x, y);
+    }
+
     synchronized void touchMove(float dx, float dy, boolean accumulated) throws Exception {
+        refreshScreenIfStale();
         if (!touching) {
             touchDown(cursorX, cursorY);
         }
@@ -147,6 +210,13 @@ final class InputController implements AutoCloseable {
         injectTouch(MotionEvent.ACTION_MOVE, nextX, nextY, touchDownTime);
         touchX = nextX;
         touchY = nextY;
+        // A press-and-drag moves the finger, so the visible pointer must travel with it and the
+        // next gesture must start from where this one ended (mouse-like absolute pointer).
+        cursorX = nextX;
+        cursorY = nextY;
+        if (cursorOverlay != null) {
+            cursorOverlay.moveCenter(cursorX, cursorY);
+        }
     }
 
     synchronized void touchUp() throws Exception {
@@ -155,7 +225,9 @@ final class InputController implements AutoCloseable {
         }
         injectTouch(MotionEvent.ACTION_UP, touchX, touchY, touchDownTime);
         touching = false;
-        cursorOverlay.release();
+        if (cursorOverlay != null) {
+            cursorOverlay.release();
+        }
         injectHover();
     }
 
@@ -191,19 +263,61 @@ final class InputController implements AutoCloseable {
         System.out.println("SkyADB clipboard paste injected, textLength=" + text.length());
     }
 
+    /**
+     * Types text with virtual-keyboard key events so the focused editor receives it even when the
+     * TV or box has no usable input method installed. Returns false when the text contains
+     * characters a virtual keyboard cannot produce, so the caller can fall back to clipboard paste.
+     */
+    synchronized boolean injectTypedText(String text) throws Exception {
+        if (text == null || text.isEmpty()) {
+            return false;
+        }
+        KeyEvent[] events = KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD)
+            .getEvents(text.toCharArray());
+        if (events == null || events.length == 0) {
+            return false;
+        }
+        for (KeyEvent event : events) {
+            injectTypedKeyEvent(event);
+        }
+        return true;
+    }
+
+    private void injectTypedKeyEvent(KeyEvent source) throws Exception {
+        long now = SystemClock.uptimeMillis();
+        inject(new KeyEvent(
+            now,
+            now,
+            source.getAction(),
+            source.getKeyCode(),
+            source.getRepeatCount(),
+            source.getMetaState(),
+            KeyCharacterMap.VIRTUAL_KEYBOARD,
+            source.getScanCode(),
+            source.getFlags() | KeyEvent.FLAG_FROM_SYSTEM,
+            InputDevice.SOURCE_KEYBOARD
+        ));
+    }
+
     private void injectTapAtCursor(long durationMs) throws Exception {
         injectTouchSequence(cursorX, cursorY, durationMs);
-        cursorOverlay.release();
+        if (cursorOverlay != null) {
+            cursorOverlay.release();
+        }
         injectHover();
     }
 
     private void injectTouchSequence(float x, float y, long durationMs) throws Exception {
         long downTime = SystemClock.uptimeMillis();
         injectTouch(MotionEvent.ACTION_DOWN, x, y, downTime);
-        cursorOverlay.press();
+        if (cursorOverlay != null) {
+            cursorOverlay.press();
+        }
         SystemClock.sleep(durationMs);
         injectTouch(MotionEvent.ACTION_UP, x, y, downTime);
-        cursorOverlay.release();
+        if (cursorOverlay != null) {
+            cursorOverlay.release();
+        }
         injectHover();
     }
 
@@ -343,11 +457,17 @@ final class InputController implements AutoCloseable {
 
     @Override
     public synchronized void close() {
-        cursorOverlay.close();
+        if (cursorOverlay != null) {
+            cursorOverlay.close();
+        }
     }
 
     private static float clamp(float value, float min, float max) {
         return Math.max(min, Math.min(value, max));
+    }
+
+    private static double clamp01(double value) {
+        return Math.max(0d, Math.min(1d, value));
     }
 
     private static final class ManagerMethod {

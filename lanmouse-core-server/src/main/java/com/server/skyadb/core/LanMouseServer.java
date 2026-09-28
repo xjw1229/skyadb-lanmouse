@@ -34,6 +34,7 @@ final class LanMouseServer implements WebSocketConnection.Listener, AutoCloseabl
     private volatile WebSocketConnection inputMethodClient;
     private volatile String previousIme;
     private volatile boolean skyAdbImeActive;
+    private volatile int imeAvailability = IME_UNKNOWN;
 
     LanMouseServer(int port, InputController input) {
         this.port = port;
@@ -140,6 +141,14 @@ final class LanMouseServer implements WebSocketConnection.Listener, AutoCloseabl
                         json.has("y") ? (float) json.optDouble("y") : input.cursorY()
                     );
                     break;
+                case "touchDownRatio":
+                    // Ratios are resolved against the live display, so a rotated or resized target
+                    // cannot leave the anchor computed from a stale client-side size.
+                    input.touchDownAtRatio(
+                        json.optDouble("rx", 0.5),
+                        json.optDouble("ry", 0.5)
+                    );
+                    break;
                 case "touchMove":
                     input.touchMove(
                         (float) json.optDouble("dx", 0),
@@ -160,13 +169,10 @@ final class LanMouseServer implements WebSocketConnection.Listener, AutoCloseabl
                     input.injectText(json.optString("text", ""));
                     break;
                 case "imeInput":
-                    forwardImeInput(json);
+                    deliverTextInput(json, false);
                     break;
                 case "imeInputDone":
-                    forwardImeInput(json);
-                    Thread.sleep(INPUT_RESTORE_DELAY_MS);
-                    dismissInputMethodView();
-                    restorePreviousInputMethod();
+                    deliverTextInput(json, true);
                     break;
                 case "imeDismiss":
                     dismissInputMethodView();
@@ -262,9 +268,79 @@ final class LanMouseServer implements WebSocketConnection.Listener, AutoCloseabl
         connection.sendText(response.toString());
     }
 
-    private void forwardImeInput(JSONObject json) throws Exception {
-        WebSocketConnection client = requireInputMethodClient();
-        client.sendText(new JSONObject(json.toString()).put("type", "imeInput").toString());
+    /**
+     * Text input entry point that keeps working on TVs and old boxes with no usable input method.
+     *
+     * <p>When {@code com.server.skyadb.lanmouse} is an installed and enabled input method the text
+     * goes through the IME bridge as before. Otherwise the text is injected straight into the
+     * focused editor with key events (and clipboard paste for characters no virtual keyboard can
+     * produce), so a box without any IME picker can still be typed into.
+     */
+    private void deliverTextInput(JSONObject json, boolean restoreAfterwards) throws Exception {
+        if (isInputMethodAvailable()) {
+            WebSocketConnection client = inputMethodClient;
+            if (client == null) {
+                switchInputMethod();
+                client = inputMethodClient;
+            }
+            if (client != null) {
+                client.sendText(new JSONObject(json.toString()).put("type", "imeInput").toString());
+                if (restoreAfterwards) {
+                    Thread.sleep(INPUT_RESTORE_DELAY_MS);
+                    dismissInputMethodView();
+                    restorePreviousInputMethod();
+                }
+                return;
+            }
+        }
+        injectTextWithoutInputMethod(json);
+        if (restoreAfterwards && skyAdbImeActive) {
+            dismissInputMethodView();
+            restorePreviousInputMethod();
+        }
+    }
+
+    private void injectTextWithoutInputMethod(JSONObject json) throws Exception {
+        String action = json.optString("action", "");
+        switch (action) {
+            case "commit": {
+                String text = json.optString("text", "");
+                if (!text.isEmpty()) {
+                    injectTextViaFocusedEditor(text);
+                }
+                break;
+            }
+            case "delete": {
+                int count = Math.max(1, Math.min(json.optInt("count", 1), MAX_DIRECT_DELETE));
+                for (int index = 0; index < count; index++) {
+                    input.keyEvent(KEYCODE_DEL);
+                }
+                break;
+            }
+            case "clear": {
+                input.keyEvent(KEYCODE_MOVE_END);
+                for (int index = 0; index < MAX_DIRECT_DELETE; index++) {
+                    input.keyEvent(KEYCODE_DEL);
+                }
+                break;
+            }
+            case "enter": {
+                input.keyEvent(KEYCODE_ENTER);
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    /** Key events first (URLs, passwords, ASCII), clipboard paste for the remaining characters. */
+    private void injectTextViaFocusedEditor(String text) throws Exception {
+        if (input.injectTypedText(text)) {
+            System.out.println("SkyADB text injected as key events without IME, textLength=" + text.length());
+            return;
+        }
+        input.injectText(text);
+        System.out.println("SkyADB text injected through clipboard without IME, textLength=" + text.length());
     }
 
     private void dismissInputMethodView() throws Exception {
@@ -274,18 +350,22 @@ final class LanMouseServer implements WebSocketConnection.Listener, AutoCloseabl
         }
     }
 
-    private WebSocketConnection requireInputMethodClient() throws Exception {
-        WebSocketConnection client = inputMethodClient;
-        if (client == null) {
-            switchInputMethod();
-            client = inputMethodClient;
+    /** True only when this box really exposes the SkyADB input method. Cached per process. */
+    private boolean isInputMethodAvailable() {
+        int cached = imeAvailability;
+        if (cached == IME_AVAILABLE) {
+            return true;
         }
-        if (client == null) {
-            throw new IllegalStateException("SkyADB input method is not connected");
+        if (cached == IME_UNAVAILABLE) {
+            return false;
         }
-        return client;
+        String listed = runShellCapture("ime", "list", "-s");
+        boolean available = listed != null && listed.contains(INPUT_METHOD);
+        imeAvailability = available ? IME_AVAILABLE : IME_UNAVAILABLE;
+        return available;
     }
 
+    /** Best effort switch: boxes without any input method keep working through direct injection. */
     private void switchInputMethod() throws Exception {
         String current = readDefaultInputMethod();
         if (current != null
@@ -296,14 +376,29 @@ final class LanMouseServer implements WebSocketConnection.Listener, AutoCloseabl
             writePreviousImeFile(current);
         }
 
-        runImeCommand("enable", INPUT_METHOD);
-        runImeCommand("set", INPUT_METHOD);
-        skyAdbImeActive = true;
-        waitForInputMethodClient();
+        boolean selected;
+        try {
+            runImeCommand("enable", INPUT_METHOD);
+            runImeCommand("set", INPUT_METHOD);
+            selected = true;
+        } catch (Exception error) {
+            selected = false;
+            System.out.println("SkyADB input method unavailable, using direct injection: "
+                + error.getMessage());
+        }
+        imeAvailability = selected ? IME_AVAILABLE : IME_UNAVAILABLE;
+        skyAdbImeActive = selected;
+        if (!selected) {
+            return;
+        }
 
+        waitForInputMethodClient();
         WebSocketConnection client = inputMethodClient;
         if (client == null) {
-            throw new IllegalStateException("SkyADB input method is not connected");
+            skyAdbImeActive = false;
+            imeAvailability = IME_UNAVAILABLE;
+            System.out.println("SkyADB input method service did not connect, using direct injection");
+            return;
         }
         client.sendText(new JSONObject().put("type", "imeShow").toString());
     }
@@ -321,7 +416,13 @@ final class LanMouseServer implements WebSocketConnection.Listener, AutoCloseabl
             System.out.println("SkyADB no previous IME available to restore");
             return;
         }
-        runImeCommand("set", target);
+        try {
+            runImeCommand("set", target);
+        } catch (Exception error) {
+            skyAdbImeActive = false;
+            System.out.println("SkyADB previous IME could not be re-selected: " + error.getMessage());
+            return;
+        }
         skyAdbImeActive = false;
         System.out.println("SkyADB restored previous IME: " + target);
     }
@@ -462,6 +563,13 @@ final class LanMouseServer implements WebSocketConnection.Listener, AutoCloseabl
         }
     }
 
+    private static final int IME_UNKNOWN = -1;
+    private static final int IME_UNAVAILABLE = 0;
+    private static final int IME_AVAILABLE = 1;
+    private static final int MAX_DIRECT_DELETE = 128;
+    private static final String KEYCODE_DEL = "KEYCODE_DEL";
+    private static final String KEYCODE_ENTER = "KEYCODE_ENTER";
+    private static final String KEYCODE_MOVE_END = "KEYCODE_MOVE_END";
     private static final long INPUT_METHOD_WAIT_MS = 2_500L;
     private static final long INPUT_METHOD_WAIT_STEP_MS = 50L;
     private static final long INPUT_RESTORE_DELAY_MS = 180L;

@@ -6,6 +6,8 @@ import android.graphics.PixelFormat;
 import android.graphics.PorterDuff;
 import android.view.Surface;
 import android.view.SurfaceControl;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -24,8 +26,8 @@ final class CursorOverlay implements AutoCloseable {
     private final Surface surface;
     private final int size;
     private final int halfSize;
-    private final int screenWidth;
-    private final int screenHeight;
+    private volatile int screenWidth;
+    private volatile int screenHeight;
     private final int layerStack;
     private final Paint ringPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint dotPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -53,23 +55,21 @@ final class CursorOverlay implements AutoCloseable {
         dotPaint.setStyle(Paint.Style.FILL);
         dotPaint.setColor(CURSOR_COLOR);
 
-        surfaceControl = new SurfaceControl.Builder()
-            .setName("SkyAdbCursor")
-            .setBufferSize(size, size)
-            .setFormat(PixelFormat.TRANSLUCENT)
-            .build();
-        surface = new Surface(surfaceControl);
+        surfaceControl = buildSurfaceControl("SkyAdbCursor", size, size);
+        surface = surfaceFor(surfaceControl);
 
         SurfaceControl.Transaction transaction = new SurfaceControl.Transaction();
         transaction.setLayer(surfaceControl, Integer.MAX_VALUE);
         transaction.setPosition(surfaceControl, left, top);
         transaction.setAlpha(surfaceControl, 1f);
-        invokeOptional(transaction, "setLayerStack", new Class<?>[] {SurfaceControl.class, int.class}, surfaceControl, layerStack);
+        if (!invokeOptional(transaction, "setLayerStack", new Class<?>[] {SurfaceControl.class, int.class}, surfaceControl, layerStack)) {
+            invokeOptional(transaction, "setLayerStack", new Class<?>[] {android.os.IBinder.class, int.class}, surfaceControl, layerStack);
+        }
         if (!invokeOptional(transaction, "setTrustedOverlay", new Class<?>[] {SurfaceControl.class, boolean.class}, surfaceControl, true)) {
             invokeOptional(transaction, "setTrustedOverlay", new Class<?>[] {SurfaceControl.class, int.class}, surfaceControl, 1);
         }
         if (!invokeOptional(transaction, "show", new Class<?>[] {SurfaceControl.class}, surfaceControl)) {
-            transaction.setVisibility(surfaceControl, true);
+            invokeOptional(transaction, "setVisibility", new Class<?>[] {SurfaceControl.class, boolean.class}, surfaceControl, true);
         }
         transaction.apply();
         transaction.close();
@@ -83,11 +83,103 @@ final class CursorOverlay implements AutoCloseable {
         visible = true;
         redraw();
         scheduleHide();
-        System.out.println("SkyADB cursor overlay created: " + size + "px, layerStack=" + layerStack);
+        System.out.println("SkyADB cursor overlay created: " + size + "px, layerStack=" + layerStack
+            + ", mode=" + renderMode());
+    }
+
+    /**
+     * Builds the cursor layer on both new and old Android releases.
+     *
+     * <p>Android 10+ exposes {@code setBufferSize(int,int)}. Android 9 (API 28) and older only accept
+     * a {@code SurfaceSession} through the package-private builder constructor and size the layer with
+     * {@code setSize(int,int)}; calling the newer API there throws {@link NoSuchMethodError} and used to
+     * kill the whole core before it could listen on its port.
+     */
+    private static SurfaceControl buildSurfaceControl(String name, int width, int height) throws Exception {
+        Throwable modernFailure = null;
+        try {
+            return new SurfaceControl.Builder()
+                .setName(name)
+                .setBufferSize(width, height)
+                .setFormat(PixelFormat.TRANSLUCENT)
+                .build();
+        } catch (Throwable error) {
+            modernFailure = error;
+        }
+
+        Class<?> sessionClass = Class.forName("android.view.SurfaceSession");
+        Constructor<?> sessionConstructor = sessionClass.getDeclaredConstructor();
+        sessionConstructor.setAccessible(true);
+        Constructor<?> builderConstructor = SurfaceControl.Builder.class.getDeclaredConstructor(sessionClass);
+        builderConstructor.setAccessible(true);
+        SurfaceControl.Builder builder =
+            (SurfaceControl.Builder) builderConstructor.newInstance(sessionConstructor.newInstance());
+        builder.setName(name);
+        if (!invokeBuilderIntPair(builder, "setBufferSize", width, height)
+            && !invokeBuilderIntPair(builder, "setSize", width, height)) {
+            throw new IllegalStateException("SurfaceControl.Builder has no buffer size setter", modernFailure);
+        }
+        invokeBuilderInt(builder, "setFormat", PixelFormat.TRANSLUCENT);
+        System.out.println("SkyADB cursor overlay uses legacy SurfaceControl builder");
+        return builder.build();
+    }
+
+    /** Android 9 has no public {@code Surface(SurfaceControl)} constructor; build it from the native handle. */
+    private static Surface surfaceFor(SurfaceControl control) throws Exception {
+        for (Constructor<?> constructor : Surface.class.getDeclaredConstructors()) {
+            Class<?>[] parameters = constructor.getParameterTypes();
+            if (parameters.length == 1 && parameters[0] == SurfaceControl.class) {
+                constructor.setAccessible(true);
+                return (Surface) constructor.newInstance(control);
+            }
+        }
+        Field nativeObject = SurfaceControl.class.getDeclaredField("mNativeObject");
+        nativeObject.setAccessible(true);
+        long controlHandle = nativeObject.getLong(control);
+        Method createFromControl =
+            Surface.class.getDeclaredMethod("nativeCreateFromSurfaceControl", long.class);
+        createFromControl.setAccessible(true);
+        long surfaceHandle = (Long) createFromControl.invoke(null, controlHandle);
+        if (surfaceHandle == 0L) {
+            throw new IllegalStateException("Surface native handle is unavailable");
+        }
+        Constructor<?> constructor = Surface.class.getDeclaredConstructor(long.class);
+        constructor.setAccessible(true);
+        return (Surface) constructor.newInstance(surfaceHandle);
+    }
+
+    private static boolean invokeBuilderIntPair(Object builder, String name, int first, int second) {
+        try {
+            Method method = SurfaceControl.Builder.class.getDeclaredMethod(name, int.class, int.class);
+            method.setAccessible(true);
+            method.invoke(builder, first, second);
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static boolean invokeBuilderInt(Object builder, String name, int value) {
+        try {
+            Method method = SurfaceControl.Builder.class.getDeclaredMethod(name, int.class);
+            method.setAccessible(true);
+            method.invoke(builder, value);
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     synchronized int centerX() {
         return left + halfSize;
+    }
+
+    /** Display size and rotation change at any time; bounds must follow instead of staying frozen. */
+    synchronized void updateBounds(int width, int height) {
+        if (width > 0 && height > 0) {
+            screenWidth = width;
+            screenHeight = height;
+        }
     }
 
     synchronized int centerY() {
@@ -110,9 +202,7 @@ final class CursorOverlay implements AutoCloseable {
         transaction.setPosition(surfaceControl, left, top);
         if (!visible) {
             transaction.setAlpha(surfaceControl, 1f);
-            if (!invokeOptional(transaction, "show", new Class<?>[] {SurfaceControl.class}, surfaceControl)) {
-                transaction.setVisibility(surfaceControl, true);
-            }
+            hideOrShow(transaction, surfaceControl, true);
             visible = true;
         }
         transaction.apply();
@@ -140,9 +230,7 @@ final class CursorOverlay implements AutoCloseable {
         if (!visible) {
             SurfaceControl.Transaction transaction = new SurfaceControl.Transaction();
             transaction.setAlpha(surfaceControl, 1f);
-            if (!invokeOptional(transaction, "show", new Class<?>[] {SurfaceControl.class}, surfaceControl)) {
-                transaction.setVisibility(surfaceControl, true);
-            }
+            hideOrShow(transaction, surfaceControl, true);
             transaction.apply();
             transaction.close();
             visible = true;
@@ -170,6 +258,9 @@ final class CursorOverlay implements AutoCloseable {
         Canvas canvas = null;
         try {
             canvas = surface.lockCanvas(null);
+            if (canvas == null) {
+                return;
+            }
             canvas.drawColor(0, PorterDuff.Mode.CLEAR);
             float center = size / 2f;
             if (scale != 1f) {
@@ -198,9 +289,7 @@ final class CursorOverlay implements AutoCloseable {
         scheduler.shutdownNow();
         try {
             SurfaceControl.Transaction transaction = new SurfaceControl.Transaction();
-            if (!invokeOptional(transaction, "hide", new Class<?>[] {SurfaceControl.class}, surfaceControl)) {
-                transaction.setVisibility(surfaceControl, false);
-            }
+            hideOrShow(transaction, surfaceControl, false);
             transaction.apply();
             transaction.close();
         } catch (Throwable ignored) {
@@ -209,6 +298,20 @@ final class CursorOverlay implements AutoCloseable {
         surface.release();
         surfaceControl.release();
         visible = false;
+    }
+
+    private static void hideOrShow(SurfaceControl.Transaction transaction, SurfaceControl control, boolean show) {
+        String preferred = show ? "show" : "hide";
+        if (invokeOptional(transaction, preferred, new Class<?>[] {SurfaceControl.class}, control)) {
+            return;
+        }
+        invokeOptional(
+            transaction,
+            "setVisibility",
+            new Class<?>[] {SurfaceControl.class, boolean.class},
+            control,
+            show
+        );
     }
 
     private static boolean invokeOptional(
