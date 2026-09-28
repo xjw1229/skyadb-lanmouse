@@ -32,7 +32,16 @@ class LanMouseServerManager(
 
         onProgress("正在安装 SkyADB 电视端服务")
         when (val installResult = adbRepository.install(serverApk)) {
-            is AdbOperationResult.Failure -> return@withContext installResult
+            is AdbOperationResult.Failure -> {
+                // A streamed install can commit successfully yet still report a non-"Success"
+                // marker on some ROMs, and reinstalling an identical package is not an error at
+                // all. The package being present is the real success condition, so check that
+                // before treating the install as failed.
+                if (!isServerPackageInstalled()) {
+                    return@withContext installResult
+                }
+                onProgress("电视端服务已存在,跳过重复安装")
+            }
             is AdbOperationResult.Success -> Unit
         }
 
@@ -220,6 +229,15 @@ class LanMouseServerManager(
         }
     }
 
+    /** True when the TV-side server package is actually installed, regardless of install output. */
+    private suspend fun isServerPackageInstalled(): Boolean {
+        return when (val result = adbRepository.runShell(ServerPackageCheckCommand)) {
+            is AdbOperationResult.Failure -> false
+            is AdbOperationResult.Success ->
+                result.data.exitCode == 0 || result.data.output.contains(ServerPackageName)
+        }
+    }
+
     /** Accepts 0 and common "shell torn down after background start" codes (143=SIGTERM, 137=SIGKILL, 1). */
     private suspend fun checkedShellSoft(command: String): AdbOperationResult<Unit> {
         return when (val result = adbRepository.runShell(command)) {
@@ -279,6 +297,7 @@ class LanMouseServerManager(
         const val RemoteStartScript = "$RemoteSkyAdbDir/start-core.sh"
         const val RemoteAutostartFlag = "$RemoteSkyAdbDir/autostart.enabled"
         const val CursorIme = "com.server.skyadb.lanmouse/.SkyAdbInputMethodService"
+        const val ServerPackageName = "com.server.skyadb.lanmouse"
         const val SkyAdbPort = 19_870
         const val PortConnectTimeoutMs = 500
         const val HandshakeTimeoutMs = 1_500
@@ -291,6 +310,8 @@ class LanMouseServerManager(
             "$PortCheckCommand && grep -q 'SkyADB cursor overlay created' $RemoteLog 2>/dev/null && grep -q 'SkyADB LAN mouse core listening' $RemoteLog 2>/dev/null"
         const val AssetsReadyCheckCommand =
             "test -f $RemoteCoreJar && pm path com.server.skyadb.lanmouse >/dev/null 2>&1"
+        const val ServerPackageCheckCommand =
+            "pm path $ServerPackageName >/dev/null 2>&1 || cmd package list packages $ServerPackageName 2>/dev/null | grep -q $ServerPackageName"
 
         val StartScriptContent = """
             #!/system/bin/sh

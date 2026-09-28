@@ -4,7 +4,10 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -75,6 +78,8 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.sky22333.skyadb.lanmouse.LanMouseConnectionStatus
 import com.sky22333.skyadb.ui.components.AppTopBar as TopAppBar
 import com.sky22333.skyadb.ui.theme.AppDimens
+import kotlinx.coroutines.withTimeoutOrNull
+
 
 @Composable
 fun FlyingMouseScreen(
@@ -177,10 +182,12 @@ fun FlyingMouseScreen(
                     dismissInputMode()
                     viewModel.tap()
                 },
-                onLongPress = {
+                onHoldStart = {
                     dismissInputMode()
-                    viewModel.longPress()
+                    viewModel.beginDrag()
                 },
+                onHoldMove = viewModel::dragBy,
+                onHoldEnd = viewModel::endDrag,
                 onScrollStart = { vertical, direction ->
                     dismissInputMode()
                     viewModel.beginScroll(vertical, direction)
@@ -304,7 +311,9 @@ private fun RemoteContent(
     onSensitivityChange: (Float) -> Unit,
     onMove: (Float, Float) -> Unit,
     onTap: () -> Unit,
-    onLongPress: () -> Unit,
+    onHoldStart: () -> Unit,
+    onHoldMove: (Float, Float) -> Unit,
+    onHoldEnd: () -> Unit,
     onScrollStart: (Boolean, Float) -> Unit,
     onScroll: (Float, Float) -> Unit,
     onScrollEnd: () -> Unit,
@@ -344,7 +353,9 @@ private fun RemoteContent(
                     height = splitPanelHeight,
                     onMove = onMove,
                     onTap = onTap,
-                    onLongPress = onLongPress,
+                    onHoldStart = onHoldStart,
+                    onHoldMove = onHoldMove,
+                    onHoldEnd = onHoldEnd,
                     onScrollStart = onScrollStart,
                     onScroll = onScroll,
                     onScrollEnd = onScrollEnd,
@@ -356,7 +367,9 @@ private fun RemoteContent(
                     height = expandedTouchpadHeight,
                     onMove = onMove,
                     onTap = onTap,
-                    onLongPress = onLongPress,
+                    onHoldStart = onHoldStart,
+                    onHoldMove = onHoldMove,
+                    onHoldEnd = onHoldEnd,
                     onScrollStart = onScrollStart,
                     onScroll = onScroll,
                     onScrollEnd = onScrollEnd,
@@ -440,7 +453,9 @@ private fun Touchpad(
     height: Dp,
     onMove: (Float, Float) -> Unit,
     onTap: () -> Unit,
-    onLongPress: () -> Unit,
+    onHoldStart: () -> Unit,
+    onHoldMove: (Float, Float) -> Unit,
+    onHoldEnd: () -> Unit,
     onScrollStart: (Boolean, Float) -> Unit,
     onScroll: (Float, Float) -> Unit,
     onScrollEnd: () -> Unit,
@@ -459,13 +474,66 @@ private fun Touchpad(
                     .weight(1f)
                     .fillMaxSize()
                     .pointerInput(Unit) {
-                        detectDragGestures { change, dragAmount ->
-                            change.consume()
-                            onMove(dragAmount.x, dragAmount.y)
+                        awaitEachGesture {
+                            val down = awaitFirstDown(requireUnconsumed = false)
+                            val slop = viewConfiguration.touchSlop
+                            val holdWindow = viewConfiguration.longPressTimeoutMillis
+
+                            // Three outcomes, decided once and then locked:
+                            //   slide -> every delta is forwarded immediately (pointer glued to the finger)
+                            //   hold  -> finger stays within slop for the whole long-press window
+                            //   tap   -> released before either the slop or the long-press window is met
+                            var travel = 0f
+                            var lifted = false
+                            var holding = false
+
+                            withTimeoutOrNull(holdWindow) {
+                                while (true) {
+                                    val next = awaitPointerEvent(PointerEventPass.Main)
+                                    val change = next.changes.firstOrNull { it.id == down.id }
+                                    if (change == null || !change.pressed) {
+                                        lifted = true
+                                        return@withTimeoutOrNull
+                                    }
+                                    val delta = change.positionChange()
+                                    if (delta.getDistance() > 0f) {
+                                        onMove(delta.x, delta.y)
+                                        travel += delta.getDistance()
+                                        change.consume()
+                                    }
+                                    if (travel > slop) {
+                                        return@withTimeoutOrNull
+                                    }
+                                }
+                            }
+                            if (!lifted && travel <= slop) {
+                                holding = true
+                                onHoldStart()
+                            }
+
+                            while (!lifted) {
+                                val next = awaitPointerEvent(PointerEventPass.Main)
+                                val change = next.changes.firstOrNull { it.id == down.id }
+                                if (change == null || !change.pressed) {
+                                    lifted = true
+                                    break
+                                }
+                                val delta = change.positionChange()
+                                if (delta.getDistance() > 0f) {
+                                    if (holding) {
+                                        onHoldMove(delta.x, delta.y)
+                                    } else {
+                                        onMove(delta.x, delta.y)
+                                    }
+                                    change.consume()
+                                }
+                            }
+
+                            when {
+                                holding -> onHoldEnd()
+                                travel <= slop -> onTap()
+                            }
                         }
-                    }
-                    .pointerInput(Unit) {
-                        detectTapGestures(onTap = { onTap() }, onLongPress = { onLongPress() })
                     },
                 contentAlignment = Alignment.Center,
             ) {

@@ -152,12 +152,11 @@ class LanMouseClient {
     fun touchDownHere(): Boolean = send(JSONObject().put("type", "touchDown"))
 
     fun touchDownForScroll(vertical: Boolean, direction: Float): Boolean {
-        val anchor = calculateScrollAnchor(screenWidth, screenHeight, vertical, direction)
         return send(
             JSONObject()
-                .put("type", "touchDown")
-                .put("x", anchor.x)
-                .put("y", anchor.y),
+                .put("type", "touchDownRatio")
+                .put("rx", scrollAnchorRatioX(vertical, direction))
+                .put("ry", scrollAnchorRatioY(vertical, direction)),
         )
     }
 
@@ -170,6 +169,34 @@ class LanMouseClient {
                 .put("dy", dy.coerceIn(-4_096, 4_096))
                 .put("accumulated", true),
         )
+    }
+
+    /**
+     * Moves an already-pressed finger by an incremental offset.
+     *
+     * <p>[dragTouchAccumulated] reports offsets from the scroll anchor, which is right for the
+     * scroll zones. A press-and-drag needs each move measured from the previous position, so it
+     * sends {@code accumulated = false}.
+     */
+    fun dragTouchBy(dx: Int, dy: Int): Boolean {
+        if (dx == 0 && dy == 0) return true
+        return send(
+            JSONObject()
+                .put("type", "touchMove")
+                .put("dx", dx.coerceIn(-4_096, 4_096))
+                .put("dy", dy.coerceIn(-4_096, 4_096))
+                .put("accumulated", false),
+        )
+    }
+
+    private fun scrollAnchorRatioX(vertical: Boolean, direction: Float): Double {
+        val directionalRatio = if (direction < 0f) 0.90 else 0.10
+        return if (vertical) 0.50 else directionalRatio
+    }
+
+    private fun scrollAnchorRatioY(vertical: Boolean, direction: Float): Double {
+        val directionalRatio = if (direction < 0f) 0.90 else 0.10
+        return if (vertical) directionalRatio else 0.50
     }
 
     fun touchUpHere(): Boolean = send(JSONObject().put("type", "touchUp"))

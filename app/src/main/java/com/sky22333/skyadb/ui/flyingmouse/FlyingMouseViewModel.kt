@@ -65,6 +65,10 @@ class FlyingMouseViewModel(application: Application) : AndroidViewModel(applicat
     private var calibrationSumZ = 0f
     private var remainderX = 0f
     private var remainderY = 0f
+    private var touchpadRemainderX = 0f
+    private var touchpadRemainderY = 0f
+    private var dragRemainderX = 0f
+    private var dragRemainderY = 0f
     private var lastEmitNanos = 0L
     private var connectionJob: Job? = null
     private var inputModeActive = false
@@ -216,7 +220,17 @@ class FlyingMouseViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun moveByTouchpad(dx: Float, dy: Float) {
-        client.moveRelative(dx.toInt(), dy.toInt())
+        // Finger travel arrives as fractional pixels. Truncating each frame dropped every slow
+        // slide (sub-pixel deltas became 0), so carry the remainder like the sensor path does.
+        touchpadRemainderX += dx
+        touchpadRemainderY += dy
+        val stepX = touchpadRemainderX.toInt()
+        val stepY = touchpadRemainderY.toInt()
+        touchpadRemainderX -= stepX
+        touchpadRemainderY -= stepY
+        if (stepX != 0 || stepY != 0) {
+            client.moveRelative(stepX, stepY)
+        }
     }
 
     fun tap() {
@@ -225,6 +239,35 @@ class FlyingMouseViewModel(application: Application) : AndroidViewModel(applicat
 
     fun longPress() {
         client.longPressHere()
+    }
+
+    /**
+     * Presses at the current pointer position without releasing.
+     *
+     * <p>A short tap is fine for buttons, but progress bars, sliders and long-press menus only
+     * react to a real press-move-release sequence. This starts that sequence so the following
+     * [dragBy] calls are reported as finger movement instead of pointer hover.
+     */
+    fun beginDrag() {
+        dragRemainderX = 0f
+        dragRemainderY = 0f
+        client.touchDownHere()
+    }
+
+    fun dragBy(dx: Float, dy: Float) {
+        dragRemainderX += dx
+        dragRemainderY += dy
+        val stepX = dragRemainderX.toInt()
+        val stepY = dragRemainderY.toInt()
+        dragRemainderX -= stepX
+        dragRemainderY -= stepY
+        if (stepX != 0 || stepY != 0) {
+            client.dragTouchBy(stepX, stepY)
+        }
+    }
+
+    fun endDrag() {
+        client.touchUpHere()
     }
 
     fun sendKey(keyCode: String) {
