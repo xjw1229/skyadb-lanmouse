@@ -1,4 +1,4 @@
-﻿import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
+import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 
 plugins {
     alias(libs.plugins.android.application)
@@ -80,8 +80,8 @@ android {
         applicationId = "com.fs.skyadb.lanmouse"
         minSdk = 24
         targetSdk = 36
-        versionCode = ciVersionCode ?: 1034
-        versionName = ciVersionName ?: "1.0.34"
+        versionCode = ciVersionCode ?: 1036
+        versionName = ciVersionName ?: "1.0.36"
     }
 
     signingConfigs {
